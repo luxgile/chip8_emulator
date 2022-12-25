@@ -1,6 +1,6 @@
 use std::{fs::File, io::Read};
 
-use imgui::Ui;
+use imgui::{TableBgTarget, Ui};
 
 const FONTSET: [u8; 80] = [
     0xF0, 0x90, 0x90, 0x90, 0xF0, // 0
@@ -25,19 +25,18 @@ pub const DISPLAY_SIZE: (usize, usize) = (64, 32);
 const MEM_OFFSET: usize = 512;
 
 pub enum RunState {
+    NoROM,
     Running,
     Paused,
 }
 
-#[derive(Default)]
-pub struct EmulationDesc {
+pub struct Emulator {
+    pub max_fps: i32,
+    pub cpf: i32,
     pub shift_swap: bool,
     pub complex_jump: bool,
-}
-
-pub struct Emulator {
-    pub desc: EmulationDesc,
     pub state: RunState,
+    frame_count: u128,
     mem: [u8; 4096],
     pub display: [[u8; DISPLAY_SIZE.1]; DISPLAY_SIZE.0],
     pc: u16,
@@ -50,10 +49,14 @@ pub struct Emulator {
 }
 
 impl Emulator {
-    pub fn new(desc: EmulationDesc) -> Self {
+    pub fn new() -> Self {
         Self {
-            desc,
-            state: RunState::Running,
+            max_fps: 60,
+            cpf: 10,
+            shift_swap: false,
+            complex_jump: false,
+            state: RunState::NoROM,
+            frame_count: 0,
             mem: [0; 4096],
             regs: [0; 16],
             display: [[0; 32]; 64],
@@ -64,6 +67,21 @@ impl Emulator {
             sound_timer: 0,
             key: None,
         }
+    }
+
+    pub fn reset(&mut self) {
+        self.mem = [0; 4096];
+        self.state = RunState::NoROM;
+        self.frame_count = 0;
+        self.mem = [0; 4096];
+        self.regs = [0; 16];
+        self.display = [[0; 32]; 64];
+        self.pc = MEM_OFFSET as u16;
+        self.reg_i = 0;
+        self.stack = Vec::new();
+        self.delay_timer = 0;
+        self.sound_timer = 0;
+        self.key = None;
     }
 
     pub fn pause(&mut self) {
@@ -78,6 +96,7 @@ impl Emulator {
         let mut file = File::open(path).expect("Not able to open ROM file.");
         file.read(&mut self.mem[MEM_OFFSET..])
             .expect("Memory overflow while reading ROM.");
+        self.resume();
     }
 
     pub fn load_font(&mut self) {
@@ -98,6 +117,13 @@ impl Emulator {
             //TODO: Do sound
         }
 
+        for n in 0..self.cpf {
+            self.internal_step();
+        }
+
+        self.frame_count += 1;
+    }
+    fn internal_step(&mut self) {
         let inst: u16 = self.curr_inst();
         self.pc += 2;
 
@@ -128,17 +154,17 @@ impl Emulator {
                 0x3 => self.op_xor(x, y),
                 0x4 => self.op_add(x, y),
                 0x5 => self.op_sub(x, y),
-                0x6 => self.op_shift_r(x, y, self.desc.shift_swap),
+                0x6 => self.op_shift_r(x, y, self.shift_swap),
                 0x7 => self.op_rsub(x, y),
-                0xE => self.op_shift_l(x, y, self.desc.shift_swap),
+                0xE => self.op_shift_l(x, y, self.shift_swap),
                 _ => {
-                    panic!("Instruction {:X} not yet implemented.", inst);
+                    eprintln!("Instruction {:X} not yet implemented.", inst);
                 }
             },
             0x9000 => self.op_rneq_skip(x, y),
             0xA000 => self.op_set_ireg(nnn),
             0xB000 => {
-                if !self.desc.complex_jump {
+                if !self.complex_jump {
                     self.op_jump_off(nnn)
                 } else {
                     self.op_jump_coff(nnn, x);
@@ -150,7 +176,7 @@ impl Emulator {
                 0x9E => self.op_key_skip(x),
                 0xA1 => self.op_nkey_skip(x),
                 _ => {
-                    panic!("Instruction {:X} not yet implemented.", inst);
+                    eprintln!("Instruction {:X} not yet implemented.", inst);
                 }
             },
             0xF000 => match nn {
@@ -164,17 +190,17 @@ impl Emulator {
                 0x55 => self.op_store(x),
                 0x65 => self.op_load(x),
                 _ => {
-                    panic!("Instruction {:X} not yet implemented.", inst);
+                    eprintln!("Instruction {:X} not yet implemented.", inst);
                 }
             },
             _ => {
-                panic!("Instruction {:X} not yet implemented.", inst);
+                eprintln!("Instruction {:X} not yet implemented.", inst);
             }
         }
     }
 
     fn op_clear_screen(&mut self) {
-        self.display.map(|x| x.map(|mut _y| _y = 0));
+        self.display = [[0; 32]; 64];
     }
 
     fn op_jump(&mut self, address: u16) {
@@ -300,8 +326,16 @@ impl Emulator {
         self.regs[15] = 0;
 
         for y in 0..val {
+            if pos_y + y >= DISPLAY_SIZE.1 as u8 {
+                break;
+            }
+
             let sprite: u8 = self.mem[(self.reg_i + y as u16) as usize];
             for x in 0..8 {
+                if pos_x + x >= DISPLAY_SIZE.0 as u8 {
+                    break;
+                }
+
                 // let pixel = sprite & (1 << 7 - x);
                 let display = self.display[(pos_x + x) as usize][(pos_y + y) as usize];
 
@@ -312,14 +346,6 @@ impl Emulator {
 
                     self.display[(pos_x + x) as usize][(pos_y + y) as usize] ^= 1;
                 }
-
-                if pos_x + x > DISPLAY_SIZE.0 as u8 {
-                    break;
-                }
-            }
-
-            if pos_y + y > DISPLAY_SIZE.1 as u8 {
-                break;
             }
         }
     }
@@ -392,52 +418,106 @@ impl Emulator {
         }
     }
 
-    pub fn draw_info(&mut self, ui: &Ui) {
-        ui.window("Control flow").build(|| match self.state {
-            RunState::Running => {
-                if ui.button("Pause") {
-                    self.pause();
+    pub fn draw_info(&mut self, ui: &Ui, ms_dt: u128) {
+        ui.window("Control flow").build(|| {
+            let mut paused = false;
+            match self.state {
+                RunState::Running => {
+                    ui.text("Emulator running...");
+                    if ui.button("Pause") {
+                        self.pause();
+                    }
                 }
+                RunState::Paused => {
+                    paused = true;
+                    ui.text("Emulator paused.");
+                    if ui.button("Resume") {
+                        self.resume();
+                    }
+                }
+                _ => {}
             }
-            RunState::Paused => {
-                if ui.button("Resume") {
-                    self.resume();
-                }
+            ui.disabled(!paused, || {
                 if ui.button("Step") {
                     self.step();
                 }
-            }
+            });
+            ui.separator();
+            ui.label_text("Frame", self.frame_count.to_string());
+            ui.label_text("Delta time (ms)", ms_dt.to_string());
         });
 
         ui.window("Emulator").build(|| {
-            ui.label_text(
-                "Program counter",
-                format!("{:?} (0x{:04X})", self.pc, self.curr_inst()),
-            );
-            let mut display_str = String::new();
-            for y in 0..DISPLAY_SIZE.1 {
-                for x in 0..DISPLAY_SIZE.0 {
-                    display_str += if self.display[x][y] == 1 { "X" } else { "_" };
+            ui.disabled(true, || {
+                ui.input_text(
+                    "Program counter",
+                    &mut format!("{:?} (0x{:04X})", self.pc, self.curr_inst()),
+                )
+                .build();
+            });
+
+            ui.separator();
+
+            ui.disabled(true, || {
+                ui.input_int("Delay timer", &mut (self.delay_timer as i32))
+                    .build();
+                ui.input_int("Sound timer", &mut (self.sound_timer as i32))
+                    .build();
+            });
+
+            ui.separator();
+
+            ui.disabled(true, || {
+                ui.input_text(
+                    "Index Register",
+                    &mut format!("{:?} (0x{:04X})", self.reg_i, self.reg_i),
+                )
+                .build();
+                for (i, reg) in self.regs.iter().enumerate() {
+                    ui.input_text(
+                        format!("Register {i}"),
+                        &mut format!("{:?} (0x{:04X})", reg, reg),
+                    )
+                    .build();
                 }
-                display_str += "\n";
-            }
-            ui.text(display_str);
+            });
+            // let mut display_str = String::new();
+            // for y in 0..DISPLAY_SIZE.1 {
+            //     for x in 0..DISPLAY_SIZE.0 {
+            //         display_str += if self.display[x][y] == 1 { "X" } else { "_" };
+            //     }
+            //     display_str += "\n";
+            // }
+            // ui.text(display_str);
         });
         ui.window("Memory").build(|| {
-            let mut memory = String::new();
-            for (i, byte) in self.mem.iter().enumerate() {
-                if i % 15 == 0 {
-                    memory += "\n"
+            let table_flags = imgui::TableFlags::RESIZABLE
+                | imgui::TableFlags::BORDERS_H
+                | imgui::TableFlags::BORDERS_V;
+            if let Some(_) =
+                ui.begin_table_with_sizing("mem_table", 2, table_flags, [300.0, 100.0], 0.0)
+            {
+                ui.table_setup_column("Index");
+                ui.table_setup_column("Value");
+                ui.table_setup_scroll_freeze(2, 1);
+                ui.table_headers_row();
+                for (i, byte) in self.mem.iter().enumerate() {
+                    if i % 2 != 0 {
+                        continue;
+                    }
+                    if i as u16 == self.pc {
+                        ui.table_set_bg_color(TableBgTarget::ROW_BG0, [0.0, 1.0, 0.0, 0.1]);
+                        if let RunState::Running = self.state {
+                            ui.set_scroll_here_y();
+                        }
+                    }
+                    ui.table_next_row();
+                    ui.table_set_column_index(0);
+                    ui.text(format!("{:} ", i).as_str());
+                    ui.table_set_column_index(1);
+                    ui.text(format!("0x{:02X}{:02X}", byte, self.mem[i + 1]).as_str());
                 }
-                if i == MEM_OFFSET {
-                    memory += "\n ---------------- \n";
-                }
-                if i as u16 == self.pc {
-                    memory += ">>>"
-                }
-                memory += format!("{:02X} ", byte).as_str();
             }
-            ui.text(memory);
         });
     }
 }

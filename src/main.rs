@@ -1,6 +1,6 @@
 use std::{
     borrow::Cow,
-    fs::File,
+    fs::{self, File},
     io::Read,
     mem,
     path::Path,
@@ -8,15 +8,15 @@ use std::{
     time::{Duration, Instant},
 };
 
-use emulator::{EmulationDesc, Emulator, RunState, DISPLAY_SIZE};
+use emulator::{Emulator, RunState, DISPLAY_SIZE};
 use image::GenericImageView;
-use imgui::FontSource;
+use imgui::{FontSource, Ui};
 use imgui_wgpu::{Renderer, RendererConfig};
 use wgpu::{
     util::{BufferInitDescriptor, DeviceExt},
     BindGroupDescriptor, BindGroupEntry, BindGroupLayoutDescriptor, BindGroupLayoutEntry,
-    BufferAddress, BufferUsages, Color, ImageDataLayout, Origin3d, SamplerDescriptor,
-    ShaderLocation, ShaderStages, TextureUsages, TextureView, TextureViewDescriptor,
+    BufferAddress, BufferUsages, ImageDataLayout, Origin3d, SamplerDescriptor, ShaderStages,
+    TextureUsages, TextureViewDescriptor,
 };
 use winit::{
     dpi::LogicalSize,
@@ -39,6 +39,8 @@ const RGBA_WHITE: [u8; 4] = [255, 255, 255, 255];
 
 fn main() {
     env_logger::init();
+    fs::create_dir_all("./resources/roms").expect("Error creating ROM path");
+    fs::create_dir_all("./resources/font").expect("Error creating fonts path");
     let eloop = EventLoop::new();
     let wnd = winit::window::Window::new(&eloop).expect("Error creating window.");
     wnd.set_inner_size(LogicalSize {
@@ -76,12 +78,10 @@ async fn run(event_loop: EventLoop<()>, wnd: Window) {
         .expect("Failed to create device");
 
     let mut shader_source = String::new();
-    File::open(Path::new(
-        "D:/Development/Rust Crates/chip_8_emulator/resources/shader.wgsl",
-    ))
-    .expect("Issue finding shader file.")
-    .read_to_string(&mut shader_source)
-    .expect("Issue reading source file.");
+    File::open(Path::new("./resources/shader.wgsl"))
+        .expect("Issue finding shader file.")
+        .read_to_string(&mut shader_source)
+        .expect("Issue reading source file.");
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: None,
         source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(shader_source.as_str())),
@@ -235,7 +235,7 @@ async fn run(event_loop: EventLoop<()>, wnd: Window) {
         format: surface.get_supported_formats(&adapter)[0],
         width: size.width,
         height: size.height,
-        present_mode: wgpu::PresentMode::Fifo,
+        present_mode: wgpu::PresentMode::AutoNoVsync,
         alpha_mode: wgpu::CompositeAlphaMode::Auto,
     };
 
@@ -250,9 +250,7 @@ async fn run(event_loop: EventLoop<()>, wnd: Window) {
         &wnd,
         imgui_winit_support::HiDpiMode::Default,
     );
-    imgui.set_ini_filename(Some(
-        Path::new("D:/Development/Rust Crates/chip_8_emulator/imgui.ini").to_path_buf(),
-    ));
+    imgui.set_ini_filename(Some(Path::new("./imgui.ini").to_path_buf()));
     imgui.io_mut().font_global_scale = (1.0 / hidpi_factor) as f32;
     imgui.fonts().add_font(&[FontSource::DefaultFontData {
         config: Some(imgui::FontConfig {
@@ -268,19 +266,12 @@ async fn run(event_loop: EventLoop<()>, wnd: Window) {
     };
     let mut renderer = Renderer::new(&mut imgui, &device, &queue, renderer_config);
 
-    let mut emulator = Emulator::new(EmulationDesc::default());
-    emulator.load_font();
-    emulator.load_rom(
-        String::from_str("D:/Development/Rust Crates/chip_8_emulator/resources/roms/Trip8 Demo (2008) [Revival Studios].ch8")
-            .unwrap(),
-    );
-
-    // for i in 0..DISPLAY_SIZE.0 {
-    //     emulator.display[i][0] = 1;
-    // }
-    // for i in 0..DISPLAY_SIZE.1 {
-    //     emulator.display[31][i] = 1;
-    // }
+    let mut emulator = Emulator::new();
+    let mut rom: usize = 0;
+    let mut roms = Vec::new();
+    for file in fs::read_dir("./resources/roms").unwrap() {
+        roms.push(String::from_str(file.unwrap().file_name().to_str().unwrap()).unwrap());
+    }
 
     let mut last_frame = Instant::now();
     let mut last_cursor = None;
@@ -303,25 +294,30 @@ async fn run(event_loop: EventLoop<()>, wnd: Window) {
                         },
                     ..
                 } => {
+                    let key_mapped = map_key(*key);
                     if let ElementState::Released = pressed {
-                        emulator.key = None;
+                        if emulator.key == key_mapped {
+                            emulator.key = None;
+                        }
                     } else {
-                        if let Some(mapped) = map_key(*key) {
+                        if let Some(mapped) = key_mapped {
                             emulator.key = Some(mapped);
                         }
                     }
                 }
                 WindowEvent::Resized(size) => {
-                    config.width = size.width;
-                    config.height = size.height;
+                    config.width = size.width.max(1);
+                    config.height = size.height.max(1);
                     surface.configure(&device, &config);
                     wnd.request_redraw();
                 }
                 _ => {}
             },
+            Event::RedrawEventsCleared => wnd.request_redraw(),
             Event::RedrawRequested(_) => {
                 let start_time = Instant::now();
-                imgui.io_mut().update_delta_time(start_time - last_frame);
+                let dt = start_time - last_frame;
+                imgui.io_mut().update_delta_time(dt);
                 last_frame = start_time;
 
                 let frame = surface
@@ -338,10 +334,11 @@ async fn run(event_loop: EventLoop<()>, wnd: Window) {
                     .expect("Failed to prepare frame.");
                 let ui = imgui.frame();
 
+                draw_emulator_setup(ui, &mut emulator, &mut rom, &mut roms);
                 if let RunState::Running = emulator.state {
                     emulator.step();
                 }
-                emulator.draw_info(ui);
+                emulator.draw_info(ui, dt.as_millis());
 
                 for x in 0..DISPLAY_SIZE.0 {
                     for y in 0..DISPLAY_SIZE.1 {
@@ -400,19 +397,38 @@ async fn run(event_loop: EventLoop<()>, wnd: Window) {
                 queue.submit(Some(encoder.finish()));
                 frame.present();
 
+                let max_fps = emulator.max_fps;
                 let elapsed_time = Instant::now().duration_since(start_time).as_millis() as u64;
-                let wait_time = if 1000 / 60 >= elapsed_time {
-                    1000 / 60 - elapsed_time
+                let wait_time = if 1000 / max_fps as u64 >= elapsed_time {
+                    (1000 / max_fps as u64) - elapsed_time
                 } else {
                     0
                 };
+                println!("{:}", wait_time);
                 let wait_instant = start_time + Duration::from_millis(wait_time);
-                *flow = ControlFlow::WaitUntil(wait_instant)
+                *flow = ControlFlow::WaitUntil(wait_instant);
             }
             _ => {}
         }
 
         platform.handle_event(imgui.io_mut(), &wnd, &event);
+    });
+}
+
+fn draw_emulator_setup(ui: &Ui, emulator: &mut Emulator, mut rom: &mut usize, roms: &Vec<String>) {
+    ui.window("Emulator Setup").build(|| {
+        ui.input_int("Max FPS", &mut emulator.max_fps).build();
+        ui.input_int("Cycles per frame", &mut emulator.cpf).build();
+        ui.checkbox("Shift Swap", &mut emulator.shift_swap);
+        ui.checkbox("Complex Jump", &mut emulator.complex_jump);
+        ui.separator();
+        ui.combo_simple_string("ROM", &mut rom, roms);
+        if ui.button("Open ROM") {
+            let rom_path = format!("./resources/roms/{:}", roms[*rom]);
+            emulator.reset();
+            emulator.load_font();
+            emulator.load_rom(String::from_str(rom_path.as_str()).unwrap());
+        }
     });
 }
 

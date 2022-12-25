@@ -11,7 +11,7 @@ wgpu = "0.14.2"
 env_logger = "0.10.0"
 pollster = "0.2.5"
 bytemuck = { version = "1.12.3", features = ["derive"]}
-imgui = "0.9.0"
+imgui = {versin = "0.9.0", features = ["tables-api"]}
 imgui-wgpu = "0.21.0"
 imgui-winit-support = "0.9.0"
 rand = "0.8.5"
